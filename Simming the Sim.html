@@ -1,0 +1,526 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Simming the Sim</title>
+<style>
+  :root{
+    --bg:#05060a;
+    --text: rgba(255,255,255,0.68);
+    --text-dim: rgba(255,255,255,0.38);
+    --panel-border: rgba(255,255,255,0.12);
+  }
+  @media (prefers-color-scheme: light){
+    :root:not([data-theme="dark"]){
+      --bg:#0c0d12;
+      --text: rgba(255,255,255,0.68);
+      --text-dim: rgba(255,255,255,0.38);
+    }
+  }
+  :root[data-theme="dark"]{
+    --bg:#05060a;
+    --text: rgba(255,255,255,0.68);
+    --text-dim: rgba(255,255,255,0.38);
+  }
+  *{ box-sizing:border-box; }
+  html,body{
+    margin:0; padding:0; height:100%; background:var(--bg); overflow:hidden;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  }
+  body{
+    padding-top: env(safe-area-inset-top,0px);
+    padding-bottom: env(safe-area-inset-bottom,0px);
+  }
+  #hud{
+    position:fixed;
+    top: calc(16px + env(safe-area-inset-top,0px));
+    left:16px; right:16px;
+    color:var(--text-dim); font-size:12.5px; line-height:1.5;
+    pointer-events:none;
+    display:flex; justify-content:space-between; gap:16px; flex-wrap:wrap;
+  }
+  #hud strong{ color:var(--text); font-weight:500; }
+  #hud .note{ max-width:360px; text-align:right; }
+  canvas{ display:block; width:100vw; height:100vh; touch-action:none; }
+  #reset{
+    position:fixed;
+    bottom: calc(16px + env(safe-area-inset-bottom,0px));
+    right:16px;
+    background:rgba(255,255,255,0.05); border:1px solid var(--panel-border);
+    color:var(--text); font-size:12.5px; padding:7px 14px; border-radius:20px;
+    cursor:pointer; backdrop-filter: blur(6px);
+  }
+  #reset:hover{ background:rgba(255,255,255,0.09); }
+  #reset:active{ transform: scale(0.96); }
+  #logToggle{
+    position:fixed;
+    bottom: calc(16px + env(safe-area-inset-bottom,0px));
+    right:96px;
+    background:rgba(255,255,255,0.05); border:1px solid var(--panel-border);
+    color:var(--text); font-size:12.5px; padding:7px 14px; border-radius:20px;
+    cursor:pointer; backdrop-filter: blur(6px);
+  }
+  #logToggle:hover{ background:rgba(255,255,255,0.09); }
+  #logPanel{
+    display:none;
+    position:fixed;
+    bottom: calc(60px + env(safe-area-inset-bottom,0px));
+    right:16px;
+    width:min(340px, calc(100vw - 32px));
+    max-height:46vh;
+    overflow-y:auto;
+    background:rgba(10,10,16,0.72);
+    border:1px solid var(--panel-border);
+    border-radius:14px;
+    padding:12px 14px;
+    backdrop-filter: blur(10px);
+    color:var(--text);
+    font-size:12px;
+    line-height:1.5;
+  }
+  #logPanel.open{ display:block; }
+  #logPanel h3{
+    margin:0 0 8px 0; font-size:12px; font-weight:500; color:var(--text-dim);
+  }
+  #logList{ display:flex; flex-direction:column; gap:8px; }
+  .logRow{ display:flex; gap:8px; align-items:flex-start; }
+  .dot{ width:8px; height:8px; border-radius:50%; margin-top:4px; flex:none; }
+  .logText{ color:var(--text-dim); }
+  .logText b{ color:var(--text); font-weight:500; }
+</style>
+</head>
+<body>
+<div id="hud">
+  <span><strong id="stats">2 agents, 1 world</strong></span>
+  <span class="note">Each agent can open exactly one world of its own, and feeds it with whatever energy it doesn't need. A struggling child can draw energy back from its parent. Once a child world is fully grown, its agents leave it behind and rejoin the world above.</span>
+</div>
+<canvas id="c" aria-label="Two independent agents moving through a constantly changing environment, each able to grow one nested sub-simulation"></canvas>
+<div id="logPanel">
+  <h3>Agents that made it out</h3>
+  <div id="logList"><span class="logText">None yet — watch for a bright border and a glowing connecting line.</span></div>
+</div>
+<button id="logToggle">connections</button>
+<button id="reset">restart</button>
+<script>
+(function(){
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d');
+  const statsEl = document.getElementById('stats');
+  let W, H, DPR;
+
+  function resize(){
+    DPR = Math.min(window.devicePixelRatio || 1, 2);
+    W = window.innerWidth; H = window.innerHeight;
+    canvas.width = Math.floor(W*DPR);
+    canvas.height = Math.floor(H*DPR);
+    canvas.style.width = W+'px'; canvas.style.height = H+'px';
+    ctx.setTransform(DPR,0,0,DPR,0,0);
+  }
+  window.addEventListener('resize', resize);
+
+  const MAX_DEPTH = 2; // root=0, children=1, grandchildren=2
+  let t = 0;
+
+  function rand(a,b){ return a + Math.random()*(b-a); }
+
+  // --- escape log ---
+  const logListEl = document.getElementById('logList');
+  const logPanelEl = document.getElementById('logPanel');
+  const escapeLog = [];
+  function logEscape(rec){
+    escapeLog.unshift(rec);
+    if(escapeLog.length > 20) escapeLog.length = 20;
+    renderLog();
+  }
+  function renderLog(){
+    if(escapeLog.length===0){
+      logListEl.innerHTML = '<span class="logText">None yet — watch for a bright border and a glowing connecting line.</span>';
+      return;
+    }
+    logListEl.innerHTML = escapeLog.slice(0,10).map(r => {
+      const climb = r.escapes>1 ? `, on its ${r.escapes===2?'second':r.escapes+'th'} climb` : '';
+      const pulledNote = r.pulled>1 ? `, drew ${Math.round(r.pulled)} energy from its parent along the way` : '';
+      return `<div class="logRow">
+        <span class="dot" style="background:hsl(${Math.round(r.hue)},80%,65%)"></span>
+        <span class="logText">Left with <b>${Math.round(r.energy)}</b> energy after a world grown for <b>${Math.round(r.worldAge)}s</b> (parent invested ${Math.round(r.fed)}, world pulled back ${Math.round(r.childPulled)})${pulledNote}${climb}.</span>
+      </div>`;
+    }).join('');
+  }
+  document.getElementById('logToggle').addEventListener('click', () => {
+    logPanelEl.classList.toggle('open');
+  });
+
+  function roundRect(ctx,x,y,w,h,r){
+    ctx.moveTo(x+r,y);
+    ctx.arcTo(x+w,y,x+w,y+h,r);
+    ctx.arcTo(x+w,y+h,x,y+h,r);
+    ctx.arcTo(x,y+h,x,y,r);
+    ctx.arcTo(x,y,x+w,y,r);
+    ctx.closePath();
+  }
+
+  class Particle{
+    constructor(bounds){ this.bounds = bounds; this.reset(); }
+    reset(){
+      const b=this.bounds;
+      this.x = rand(b.x, b.x+b.w);
+      this.y = rand(b.y, b.y+b.h);
+      this.vx = rand(-6,6);
+      this.vy = rand(-6,6);
+      this.r = rand(0.5,1.6);
+      this.a = rand(0.15,0.5);
+    }
+    update(dt){
+      const b=this.bounds;
+      this.x += this.vx*dt;
+      this.y += this.vy*dt;
+      if(this.x<b.x) this.x=b.x+b.w;
+      if(this.x>b.x+b.w) this.x=b.x;
+      if(this.y<b.y) this.y=b.y+b.h;
+      if(this.y>b.y+b.h) this.y=b.y;
+    }
+    draw(ctx, hue){
+      ctx.beginPath();
+      ctx.fillStyle = `hsla(${hue},70%,75%,${this.a})`;
+      ctx.arc(this.x,this.y,this.r,0,Math.PI*2);
+      ctx.fill();
+    }
+  }
+
+  class Resource{
+    constructor(bounds){
+      const b=bounds;
+      this.x = rand(b.x+10, b.x+b.w-10);
+      this.y = rand(b.y+10, b.y+b.h-10);
+      this.r = rand(3,5);
+      this.life = rand(6,14);
+      this.age = 0;
+      this.value = rand(18,30);
+    }
+    update(dt){ this.age += dt; }
+    get dead(){ return this.age > this.life; }
+    draw(ctx, hue){
+      const fade = Math.max(0, 1 - this.age/this.life);
+      ctx.beginPath();
+      ctx.fillStyle = `hsla(${(hue+140)%360},80%,65%,${0.55*fade})`;
+      ctx.arc(this.x,this.y,this.r,0,Math.PI*2);
+      ctx.fill();
+    }
+  }
+
+  class Agent{
+    constructor(bounds, hue, depth){
+      const b=bounds;
+      this.x = rand(b.x+20, b.x+b.w-20);
+      this.y = rand(b.y+20, b.y+b.h-20);
+      this.vx = rand(-20,20);
+      this.vy = rand(-20,20);
+      this.hue = hue;
+      this.depth = depth;
+      this.energy = rand(30,50);
+      this.maxEnergy = 100;
+      this.baseRadius = Math.max(4, 9 - depth*2);
+      this.wanderAngle = rand(0, Math.PI*2);
+      this.spawnCooldown = rand(4,8);
+      this.childWorld = null;
+      this.totalPulled = 0;   // lifetime energy pulled from a parent
+      this.escapes = 0;       // how many levels up it has climbed
+    }
+    update(dt, world){
+      const b = world.bounds;
+
+      let target=null, best=Infinity;
+      for(const r of world.resources){
+        const d = (r.x-this.x)**2 + (r.y-this.y)**2;
+        if(d<best){ best=d; target=r; }
+      }
+
+      let ax=0, ay=0;
+      if(target && Math.sqrt(best) < b.w*0.6){
+        ax = target.x-this.x; ay = target.y-this.y;
+        const m = Math.hypot(ax,ay) || 1;
+        ax/=m; ay/=m;
+        if(Math.sqrt(best) < this.baseRadius + target.r + 2){
+          this.energy = Math.min(this.maxEnergy, this.energy + target.value);
+          target.age = target.life + 1;
+        }
+      } else {
+        this.wanderAngle += rand(-0.6,0.6)*dt*6;
+        ax = Math.cos(this.wanderAngle);
+        ay = Math.sin(this.wanderAngle);
+      }
+
+      const speed = 34 + this.depth*6;
+      this.vx += ax*speed*dt*1.4;
+      this.vy += ay*speed*dt*1.4;
+      const sp = Math.hypot(this.vx,this.vy);
+      if(sp>speed){ this.vx = this.vx/sp*speed; this.vy = this.vy/sp*speed; }
+
+      this.x += this.vx*dt;
+      this.y += this.vy*dt;
+
+      const pad = this.baseRadius+2;
+      if(this.x < b.x+pad){ this.x=b.x+pad; this.vx*=-0.8; }
+      if(this.x > b.x+b.w-pad){ this.x=b.x+b.w-pad; this.vx*=-0.8; }
+      if(this.y < b.y+pad){ this.y=b.y+pad; this.vy*=-0.8; }
+      if(this.y > b.y+b.h-pad){ this.y=b.y+b.h-pad; this.vy*=-0.8; }
+
+      this.energy = Math.max(0, this.energy - dt*2.2);
+      this.spawnCooldown -= dt;
+
+      // open exactly one world of its own, once it can afford to
+      if(this.energy > 78 && !this.childWorld && world.depth < MAX_DEPTH && this.spawnCooldown <= 0){
+        world.spawnChild(this);
+        this.energy *= 0.7;
+        this.spawnCooldown = rand(10,18);
+      }
+
+      // once that world is fully grown, an agent inside it can leave for the world above
+      if(world.depth > 0 && world.parentWorld &&
+         world.development >= world.maxDevelopment &&
+         this.energy > 70 &&
+         world.parentWorld.agents.length < 8 &&
+         Math.random() < dt*0.15){
+        world.escapeAgent(this);
+      }
+    }
+    draw(ctx, world){
+      const devRatio = world.depth>0 ? (world.development/world.maxDevelopment) : 0;
+      const effR = this.baseRadius * (1 + 0.6*devRatio);
+      const pulse = 1 + 0.15*Math.sin(t*3 + this.x*0.01);
+      const r = effR*pulse;
+      const glow = 0.3 + 0.5*(this.energy/this.maxEnergy);
+
+      ctx.beginPath();
+      ctx.fillStyle = `hsla(${this.hue},85%,68%,${glow})`;
+      ctx.shadowColor = `hsla(${this.hue},85%,60%,0.8)`;
+      ctx.shadowBlur = 10;
+      ctx.arc(this.x,this.y,r,0,Math.PI*2);
+      ctx.fill();
+      ctx.shadowBlur = 0;
+
+      ctx.beginPath();
+      ctx.strokeStyle = `hsla(${this.hue},90%,80%,0.5)`;
+      ctx.lineWidth = 1.2;
+      ctx.arc(this.x,this.y, r+3, -Math.PI/2, -Math.PI/2 + Math.PI*2*(this.energy/this.maxEnergy));
+      ctx.stroke();
+    }
+  }
+
+  class World{
+    constructor(bounds, depth, seedHue, parentAgent, parentWorld){
+      this.bounds = bounds;
+      this.depth = depth;
+      this.seedHue = seedHue;
+      this.parentAgent = parentAgent || null;
+      this.parentWorld = parentWorld || null;
+      this.children = [];
+      this.particles = [];
+      this.resources = [];
+      this.age = 0;
+      this.dissolving = false;
+      this.dyingTimer = 0;
+      this.fadeIn = 0;
+      this.resourceTimer = 0;
+
+      this.development = 0;
+      this.maxDevelopment = 220;
+      this.flowStrength = 0;   // parent -> child (growth)
+      this.pullStrength = 0;   // child -> parent (rescue)
+      this.totalFed = 0;       // lifetime energy invested by the parent
+      this.totalPulled = 0;    // lifetime energy pulled back by children
+
+      const pCount = depth===0 ? 60 : 16;
+      for(let i=0;i<pCount;i++) this.particles.push(new Particle(bounds));
+
+      this.agents = [];
+      for(let i=0;i<2;i++){
+        this.agents.push(new Agent(bounds, (seedHue + i*160)%360, depth));
+      }
+    }
+
+    spawnChild(parentAgent){
+      const b = this.bounds;
+      const size = Math.max(70, Math.min(b.w,b.h) * rand(0.32,0.42));
+      let cx = parentAgent.x - size/2;
+      let cy = parentAgent.y - size/2;
+      cx = Math.max(b.x+4, Math.min(b.x+b.w-size-4, cx));
+      cy = Math.max(b.y+4, Math.min(b.y+b.h-size-4, cy));
+      const child = new World({x:cx,y:cy,w:size,h:size}, this.depth+1, (parentAgent.hue+40)%360, parentAgent, this);
+      parentAgent.childWorld = child;
+      this.children.push(child);
+    }
+
+    escapeAgent(agent){
+      const idx = this.agents.indexOf(agent);
+      if(idx===-1) return;
+
+      agent.escapes += 1;
+      logEscape({
+        hue: agent.hue,
+        energy: agent.energy,
+        pulled: agent.totalPulled,
+        escapes: agent.escapes,
+        worldAge: this.age,
+        fed: this.totalFed,
+        childPulled: this.totalPulled
+      });
+
+      this.agents.splice(idx,1);
+      agent.depth = Math.max(0, this.depth-1);
+      agent.vx += rand(-8,8);
+      agent.vy += rand(-8,8);
+      if(this.parentWorld) this.parentWorld.agents.push(agent);
+      if(this.agents.length===0){
+        this.dissolving = true;
+        if(this.parentAgent) this.parentAgent.childWorld = null;
+      }
+    }
+
+    update(dt){
+      this.age += dt;
+      this.fadeIn = Math.min(1, this.fadeIn + dt*1.5);
+
+      // energy bond with parent
+      this.flowStrength = Math.max(0, this.flowStrength - dt*1.2);
+      this.pullStrength = Math.max(0, this.pullStrength - dt*1.2);
+      if(this.parentAgent){
+        const p = this.parentAgent;
+        const baseline = 25;
+        if(p.energy > baseline && this.development < this.maxDevelopment){
+          const amt = Math.min(p.energy-baseline, dt*16);
+          p.energy -= amt;
+          this.development = Math.min(this.maxDevelopment, this.development+amt);
+          this.totalFed += amt;
+          this.flowStrength = 1;
+        }
+        let weakest=null, min=999;
+        for(const a of this.agents){ if(a.energy<min){ min=a.energy; weakest=a; } }
+        if(weakest && weakest.energy<15 && p.energy>40){
+          const pull = Math.min(dt*12, p.energy-40);
+          if(pull>0){
+            p.energy -= pull;
+            weakest.energy = Math.min(weakest.maxEnergy, weakest.energy+pull);
+            weakest.totalPulled += pull;
+            this.totalPulled += pull;
+            this.pullStrength = 1;
+          }
+        }
+      }
+
+      const devRatio = this.development/this.maxDevelopment;
+      this.resourceTimer -= dt;
+      const maxRes = (this.depth===0?9:5) + Math.round(devRatio*4);
+      if(this.resourceTimer<=0 && this.resources.length < maxRes){
+        this.resources.push(new Resource(this.bounds));
+        this.resourceTimer = rand(0.8,2.2)*(1-0.4*devRatio);
+      }
+      this.resources = this.resources.filter(r=>!r.dead);
+      for(const r of this.resources) r.update(dt);
+
+      if(this.depth>0){
+        const targetP = 16 + Math.round(devRatio*14);
+        while(this.particles.length < targetP) this.particles.push(new Particle(this.bounds));
+      }
+      for(const p of this.particles) p.update(dt);
+
+      for(const a of this.agents.slice()) a.update(dt, this);
+      for(const c of this.children.slice()) c.update(dt);
+
+      for(const c of this.children){
+        if(c.agents.length===0) c.dissolving = true;
+        if(c.dissolving) c.dyingTimer += dt;
+      }
+      this.children = this.children.filter(c => !(c.dissolving && c.dyingTimer>1.2));
+    }
+
+    draw(ctx){
+      const b=this.bounds;
+      const hue = (this.seedHue + this.depth*47 + t*4) % 360;
+      let alpha = this.fadeIn;
+      if(this.dissolving) alpha *= Math.max(0, 1 - this.dyingTimer/1.2);
+
+      ctx.save();
+      ctx.globalAlpha = alpha;
+
+      if(this.depth>0){
+        ctx.beginPath();
+        ctx.fillStyle = `hsla(${hue},40%,10%,0.55)`;
+        ctx.strokeStyle = `hsla(${hue},60%,70%,${0.3+0.35*(this.development/this.maxDevelopment)})`;
+        ctx.lineWidth = 1;
+        roundRect(ctx,b.x,b.y,b.w,b.h,10);
+        ctx.fill(); ctx.stroke();
+        ctx.save();
+        ctx.beginPath();
+        roundRect(ctx,b.x,b.y,b.w,b.h,10);
+        ctx.clip();
+      }
+
+      for(const p of this.particles) p.draw(ctx, hue);
+      for(const r of this.resources) r.draw(ctx, hue);
+      for(const a of this.agents) a.draw(ctx, this);
+
+      if(this.depth>0) ctx.restore();
+
+      // energy bonds to children, drawn in this world's own coordinate space
+      for(const c of this.children){
+        if(c.flowStrength>0.02 || c.pullStrength>0.02){
+          const ccx = c.bounds.x + c.bounds.w/2, ccy = c.bounds.y + c.bounds.h/2;
+          const op = Math.max(c.flowStrength, c.pullStrength) * 0.4;
+          ctx.beginPath();
+          ctx.moveTo(c.parentAgent.x, c.parentAgent.y);
+          ctx.lineTo(ccx, ccy);
+          ctx.strokeStyle = c.pullStrength > c.flowStrength
+            ? `hsla(${c.seedHue},80%,70%,${op})`
+            : `hsla(${c.parentAgent.hue},80%,70%,${op})`;
+          ctx.lineWidth = 1;
+          ctx.stroke();
+        }
+      }
+
+      for(const c of this.children) c.draw(ctx);
+      ctx.restore();
+    }
+  }
+
+  let root;
+  function init(){
+    resize();
+    root = new World({x:0,y:0,w:W,h:H}, 0, rand(0,360), null, null);
+    escapeLog.length = 0;
+    renderLog();
+  }
+
+  function countWorlds(w){ let n=1; for(const c of w.children) n+=countWorlds(c); return n; }
+  function countAgents(w){ let n=w.agents.length; for(const c of w.children) n+=countAgents(c); return n; }
+
+  let last = performance.now();
+  function loop(now){
+    const dt = Math.min(0.05, (now-last)/1000);
+    last = now;
+    t += dt;
+
+    const bgHue = (t*6) % 360;
+    const g = ctx.createLinearGradient(0,0,W,H);
+    g.addColorStop(0, `hsl(${bgHue},35%,6%)`);
+    g.addColorStop(1, `hsl(${(bgHue+70)%360},30%,4%)`);
+    ctx.fillStyle = g;
+    ctx.fillRect(0,0,W,H);
+
+    root.update(dt);
+    root.draw(ctx);
+
+    const a = countAgents(root), wc = countWorlds(root);
+    statsEl.textContent = `${a} agent${a===1?'':'s'}, ${wc} world${wc===1?'':'s'}`;
+
+    requestAnimationFrame(loop);
+  }
+
+  document.getElementById('reset').addEventListener('click', init);
+  init();
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
